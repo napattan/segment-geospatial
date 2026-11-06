@@ -867,7 +867,7 @@ def coords_to_xy(
     all_coords = np.array(all_coords)
     if input_is_3d:
         if len(output) > 0:
-            output = output.reshape(original_shape)
+            output = output.reshape(-1, *original_shape[1:])
         if len(all_coords) > 0:
             all_coords = all_coords.reshape(original_shape)
 
@@ -901,10 +901,20 @@ def boxes_to_vector(coords, src_crs, dst_crs="EPSG:4326", output=None, **kwargs)
         geopandas.GeoDataFrame or None: The GeoDataFrame with the converted vector data if output is None, otherwise None if the data is saved to a file.
     """
 
+    import shapely
     from shapely.geometry import box
 
-    # Create a list of Shapely Polygon objects based on the provided coordinates
-    polygons = [box(*coord) for coord in coords]
+    # Create Shapely Polygon objects based on the provided coordinates
+    coords_arr = np.asarray(coords)
+    if coords_arr.ndim == 2 and coords_arr.shape[1] == 4:
+        polygons = shapely.box(
+            coords_arr[:, 0],
+            coords_arr[:, 1],
+            coords_arr[:, 2],
+            coords_arr[:, 3],
+        )
+    else:
+        polygons = [box(*coord) for coord in coords]
 
     # Create a GeoDataFrame with the Shapely Polygon objects
     gdf = gpd.GeoDataFrame({"geometry": polygons}, crs=src_crs)
@@ -1016,24 +1026,33 @@ def bbox_to_xy(
         width = src.width
         height = src.height
 
-        for coord in coords:
-            minx, miny, maxx, maxy = coord
-
+        if len(coords) > 0:
             if coord_crs != src.crs:
-                minx, miny = transform_coords(minx, miny, coord_crs, src.crs, **kwargs)
-                maxx, maxy = transform_coords(maxx, maxy, coord_crs, src.crs, **kwargs)
+                minxs = [coord[0] for coord in coords]
+                minys = [coord[1] for coord in coords]
+                maxxs = [coord[2] for coord in coords]
+                maxys = [coord[3] for coord in coords]
+
+                minxs, minys = transform_coords(
+                    minxs, minys, coord_crs, src.crs, **kwargs
+                )
+                maxxs, maxys = transform_coords(
+                    maxxs, maxys, coord_crs, src.crs, **kwargs
+                )
 
                 rows1, cols1 = rasterio.transform.rowcol(
-                    src.transform, minx, miny, **kwargs
+                    src.transform, minxs, minys, **kwargs
                 )
                 rows2, cols2 = rasterio.transform.rowcol(
-                    src.transform, maxx, maxy, **kwargs
+                    src.transform, maxxs, maxys, **kwargs
                 )
 
-                new_coords.append([cols1, rows1, cols2, rows2])
-
+                new_coords = [
+                    [int(c1), int(r1), int(c2), int(r2)]
+                    for c1, r1, c2, r2 in zip(cols1, rows1, cols2, rows2)
+                ]
             else:
-                new_coords.append([minx, miny, maxx, maxy])
+                new_coords = [[c[0], c[1], c[2], c[3]] for c in coords]
 
     result = []
 
@@ -1290,7 +1309,7 @@ def tiff_to_tiff(
         profile = src.profile
 
         if nodata_value is None:
-            nodata_values = profile.get("nodata", None)
+            nodata_value = profile.get("nodata", None)
 
         # Computer blocks
         rh, rw = profile["height"], profile["width"]
@@ -3213,10 +3232,11 @@ def regularize_legacy(source, output=None, crs="EPSG:4326", **kwargs):
     else:
         raise ValueError("The input source must be a GeoDataFrame or a file path.")
 
-    polygons = gdf.geometry.apply(lambda geom: geom.minimum_rotated_rectangle)
-    result = gpd.GeoDataFrame(geometry=polygons, data=gdf.drop("geometry", axis=1))
+    result = gdf.copy()
+    mrr = gdf.geometry.minimum_rotated_rectangle
+    result["geometry"] = mrr() if callable(mrr) else mrr
 
-    if crs is not None:
+    if crs is not None and result.crs is not None:
         result.to_crs(crs, inplace=True)
     if output is not None:
         result.to_file(output, **kwargs)
@@ -3242,10 +3262,10 @@ def simplify(source, tolerance=0.01, output=None, **kwargs):
     else:
         raise ValueError("The input source must be a GeoDataFrame or a file path.")
 
-    polygons = gdf.geometry.apply(
-        lambda geom: geom.simplify(tolerance, preserve_topology=True, **kwargs)
+    result = gdf.copy()
+    result["geometry"] = gdf.geometry.simplify(
+        tolerance, preserve_topology=True
     )
-    result = gpd.GeoDataFrame(geometry=polygons, data=gdf.drop("geometry", axis=1))
 
     if output is not None:
         result.to_file(output)
@@ -4117,14 +4137,13 @@ def region_groups(
 
     # Get the labels of regions with area smaller than the threshold
     small_regions = df[df["area"] < min_size]["label"].values
-    # Set the corresponding labels in the label_image to zero
-    for region_label in small_regions:
-        label_image[label_image == region_label] = 0
-
-    if max_size is not None:
-        large_regions = df[df["area"] > max_size]["label"].values
-        for region_label in large_regions:
-            label_image[label_image == region_label] = 0
+    if label_image.max() > 0:
+        lut = np.arange(label_image.max() + 1, dtype=label_image.dtype)
+        lut[small_regions] = 0
+        if max_size is not None:
+            large_regions = df[df["area"] > max_size]["label"].values
+            lut[large_regions] = 0
+        label_image = lut[label_image]
 
     # Find the background (holes) which are zeros
     holes = label_image == 0
@@ -4173,7 +4192,12 @@ def region_groups(
     )
 
     df = pd.DataFrame(props)
-    df["elongation"] = df["axis_major_length"] / df["axis_minor_length"]
+    with np.errstate(divide="ignore", invalid="ignore"):
+        df["elongation"] = np.where(
+            df["axis_minor_length"] > 0,
+            df["axis_major_length"] / df["axis_minor_length"],
+            np.nan,
+        )
 
     dtype = "uint8"
     if num_labels > 255 and num_labels <= 65535:

@@ -2389,39 +2389,20 @@ class SamGeo3:
             box_labels = [True] * len(boxes)
 
         # Transform boxes from CRS to pixel coordinates if needed
-        if box_crs is not None and self.source is not None:
-            pixel_boxes = []
-            for box in boxes:
-                xmin, ymin, xmax, ymax = box
-
-                # Transform min corner
-                min_coords = np.array([[xmin, ymin]])
-                min_xy, _ = common.coords_to_xy(
-                    self.source, min_coords, box_crs, return_out_of_bounds=True
-                )
-
-                # Transform max corner
-                max_coords = np.array([[xmax, ymax]])
-                max_xy, _ = common.coords_to_xy(
-                    self.source, max_coords, box_crs, return_out_of_bounds=True
-                )
-
-                # Convert to pixel coordinates and ensure correct min/max order
-                # (geographic y increases north, pixel y increases down)
-                x1_px = min_xy[0][0]
-                y1_px = min_xy[0][1]
-                x2_px = max_xy[0][0]
-                y2_px = max_xy[0][1]
-
-                # Ensure we have correct min/max values
-                x_min_px = min(x1_px, x2_px)
-                y_min_px = min(y1_px, y2_px)
-                x_max_px = max(x1_px, x2_px)
-                y_max_px = max(y1_px, y2_px)
-
-                pixel_boxes.append([x_min_px, y_min_px, x_max_px, y_max_px])
-
-            boxes = pixel_boxes
+        if box_crs is not None and self.source is not None and len(boxes) > 0:
+            boxes_arr = np.asarray(boxes)
+            corners = boxes_arr.reshape(-1, 2)
+            corners_xy, _ = common.coords_to_xy(
+                self.source, corners, box_crs, return_out_of_bounds=True
+            )
+            corners_xy = corners_xy.reshape(-1, 2, 2)
+            x_min_px = np.minimum(corners_xy[:, 0, 0], corners_xy[:, 1, 0])
+            y_min_px = np.minimum(corners_xy[:, 0, 1], corners_xy[:, 1, 1])
+            x_max_px = np.maximum(corners_xy[:, 0, 0], corners_xy[:, 1, 0])
+            y_max_px = np.maximum(corners_xy[:, 0, 1], corners_xy[:, 1, 1])
+            boxes = np.column_stack(
+                [x_min_px, y_min_px, x_max_px, y_max_px]
+            ).tolist()
 
         # Convert image to PIL if needed
         if isinstance(self.image, np.ndarray):
@@ -3331,17 +3312,12 @@ class SamGeo3:
             box = np.array(box)
             if box.ndim == 1:
                 # Single box [xmin, ymin, xmax, ymax]
-                xmin, ymin, xmax, ymax = box
-                min_coords = np.array([[xmin, ymin]])
-                max_coords = np.array([[xmax, ymax]])
-                min_xy, _ = common.coords_to_xy(
-                    self.source, min_coords, box_crs, return_out_of_bounds=True
+                corners = box.reshape(2, 2)
+                corners_xy, _ = common.coords_to_xy(
+                    self.source, corners, box_crs, return_out_of_bounds=True
                 )
-                max_xy, _ = common.coords_to_xy(
-                    self.source, max_coords, box_crs, return_out_of_bounds=True
-                )
-                x1_px, y1_px = min_xy[0]
-                x2_px, y2_px = max_xy[0]
+                x1_px, y1_px = corners_xy[0]
+                x2_px, y2_px = corners_xy[1]
                 box = np.array(
                     [
                         min(x1_px, x2_px),
@@ -3350,30 +3326,21 @@ class SamGeo3:
                         max(y1_px, y2_px),
                     ]
                 )
-            else:
+            elif len(box) > 0:
                 # Multiple boxes [B, 4]
-                transformed_boxes = []
-                for b in box:
-                    xmin, ymin, xmax, ymax = b
-                    min_coords = np.array([[xmin, ymin]])
-                    max_coords = np.array([[xmax, ymax]])
-                    min_xy, _ = common.coords_to_xy(
-                        self.source, min_coords, box_crs, return_out_of_bounds=True
-                    )
-                    max_xy, _ = common.coords_to_xy(
-                        self.source, max_coords, box_crs, return_out_of_bounds=True
-                    )
-                    x1_px, y1_px = min_xy[0]
-                    x2_px, y2_px = max_xy[0]
-                    transformed_boxes.append(
-                        [
-                            min(x1_px, x2_px),
-                            min(y1_px, y2_px),
-                            max(x1_px, x2_px),
-                            max(y1_px, y2_px),
-                        ]
-                    )
-                box = np.array(transformed_boxes)
+                corners = box.reshape(-1, 2)
+                corners_xy, _ = common.coords_to_xy(
+                    self.source, corners, box_crs, return_out_of_bounds=True
+                )
+                corners_xy = corners_xy.reshape(-1, 2, 2)
+                box = np.column_stack(
+                    [
+                        np.minimum(corners_xy[:, 0, 0], corners_xy[:, 1, 0]),
+                        np.minimum(corners_xy[:, 0, 1], corners_xy[:, 1, 1]),
+                        np.maximum(corners_xy[:, 0, 0], corners_xy[:, 1, 0]),
+                        np.maximum(corners_xy[:, 0, 1], corners_xy[:, 1, 1]),
+                    ]
+                )
 
         # Call the model's predict_inst method
         with self._meta_autocast():
@@ -3673,8 +3640,9 @@ class SamGeo3:
                 gdf.crs = point_crs
 
             # Extract point coordinates from geometry
-            points_list = gdf.geometry.apply(lambda geom: [geom.x, geom.y]).tolist()
-            coordinates_array = np.array([[point] for point in points_list])
+            coordinates_array = np.column_stack(
+                [gdf.geometry.x.to_numpy(), gdf.geometry.y.to_numpy()]
+            )[:, None, :]
 
             # Convert coordinates to pixel coordinates
             points, out_of_bounds = common.coords_to_xy(
@@ -3684,8 +3652,11 @@ class SamGeo3:
 
             # Filter labels to match filtered coordinates
             if point_labels_batch is not None and len(out_of_bounds) > 0:
+                out_of_bounds_set = set(out_of_bounds)
                 valid_indices = [
-                    i for i in range(len(points_list)) if i not in out_of_bounds
+                    i
+                    for i in range(len(coordinates_array))
+                    if i not in out_of_bounds_set
                 ]
                 point_labels_batch = [point_labels_batch[i] for i in valid_indices]
 
@@ -3707,10 +3678,11 @@ class SamGeo3:
                 # Filter labels to match filtered coordinates
                 if point_labels_batch is not None:
                     # Create a mask for valid (in-bounds) indices
+                    out_of_bounds_set = set(out_of_bounds)
                     valid_indices = [
                         i
                         for i in range(len(point_coords_batch))
-                        if i not in out_of_bounds
+                        if i not in out_of_bounds_set
                     ]
                     point_labels_batch = [point_labels_batch[i] for i in valid_indices]
             else:
@@ -3814,6 +3786,10 @@ class SamGeo3:
                 self.boxes.append(np.array([xs.min(), ys.min(), xs.max(), ys.max()]))
             else:
                 self.boxes.append(np.array([0, 0, 0, 0]))
+
+        # Filter masks by size if min_size or max_size is specified
+        if min_size > 0 or max_size is not None:
+            self._filter_masks_by_size(min_size, max_size)
 
         # Save masks if output path is provided
         if output is not None:

@@ -642,7 +642,7 @@ class SamGeo:
         else:
             masks, scores, logits = predictor.predict_torch(
                 point_coords=point_coords,
-                point_labels=point_coords,
+                point_labels=point_labels,
                 boxes=input_boxes,
                 multimask_output=True,
             )

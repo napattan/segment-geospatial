@@ -692,7 +692,7 @@ class SamGeo:
         else:
             masks, scores, logits = predictor.predict_torch(
                 point_coords=point_coords,
-                point_labels=point_coords,
+                point_labels=point_labels,
                 boxes=input_boxes,
                 multimask_output=True,
             )
@@ -745,25 +745,29 @@ class SamGeo:
             print("No objects found in the image.")
             return
         else:
-            # Create an empty image to store the mask overlays
-            mask_overlay = np.zeros_like(
-                image_np[..., 0], dtype=dtype
-            )  # Adjusted for single channel
-
-            for i, (box, mask) in enumerate(zip(boxes, masks)):
-                # Convert tensor to numpy array if necessary and ensure it contains integers
-                if isinstance(mask, torch.Tensor):
-                    mask = (
-                        mask.cpu().numpy().astype(dtype)
-                    )  # If mask is on GPU, use .cpu() before .numpy()
-                mask_overlay += ((mask > 0) * (i + 1)).astype(
-                    dtype
-                )  # Assign a unique value for each mask
-
-            # Normalize mask_overlay to be in [0, 255]
-            mask_overlay = (
-                mask_overlay > 0
-            ) * mask_multiplier  # Binary mask in [0, 255]
+            n_masks = min(len(boxes), len(masks))
+            if n_masks == 0:
+                mask_overlay = np.zeros_like(image_np[..., 0], dtype=dtype)
+            else:
+                masks_subset = masks[:n_masks]
+                if isinstance(masks_subset, torch.Tensor):
+                    any_mask = (masks_subset > 0).any(dim=0).cpu().numpy()
+                elif (
+                    isinstance(masks_subset, np.ndarray)
+                    and masks_subset.dtype != object
+                ):
+                    any_mask = (masks_subset > 0).any(axis=0)
+                else:
+                    masks_arr = np.asarray(
+                        [
+                            m.cpu().numpy()
+                            if isinstance(m, torch.Tensor)
+                            else np.asarray(m)
+                            for m in masks_subset
+                        ]
+                    )
+                    any_mask = (masks_arr > 0).any(axis=0)
+                mask_overlay = (any_mask * mask_multiplier).astype(dtype)
 
         if output is not None:
             array_to_image(mask_overlay, output, self.source, dtype=dtype, **save_args)
